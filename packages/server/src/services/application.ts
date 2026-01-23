@@ -39,9 +39,12 @@ import {
 } from "./deployment";
 import { type Domain, getDomainHost } from "./domain";
 import {
+	createCommitStatus,
+	createGithubDeployment,
 	createPreviewDeploymentComment,
 	getIssueComment,
 	issueCommentExists,
+	updateGithubDeploymentStatus,
 	updateIssueComment,
 } from "./github";
 import {
@@ -366,6 +369,10 @@ export const deployPreviewApplication = async ({
 		comment_id: Number.parseInt(previewDeployment.pullRequestCommentId),
 		githubId: application?.githubId || "",
 	};
+
+	let githubDeploymentId: number | null = null;
+	let commitHash: string | null = null;
+
 	try {
 		const commentExists = await issueCommentExists({
 			...issueParams,
@@ -413,6 +420,71 @@ export const deployPreviewApplication = async ({
 				appName: previewDeployment.appName,
 				branch: previewDeployment.branch,
 			});
+
+			// Get commit info to set status on the actual commit
+			const commitInfo = await getGitCommitInfo({
+				appName: previewDeployment.appName,
+				type: "application",
+				serverId: application.serverId,
+			});
+
+			if (commitInfo?.hash) {
+				commitHash = commitInfo.hash;
+				// Store commit hash in preview deployment
+				await updatePreviewDeployment(previewDeploymentId, {
+					commitHash,
+				});
+
+				// Create GitHub deployment
+				try {
+					const ghDeployment = await createGithubDeployment({
+						owner: application.owner || "",
+						repository: application.repository || "",
+						ref: commitHash,
+						environment: "preview",
+						description: `Preview deployment for PR #${previewDeployment.pullRequestNumber}`,
+						githubId: application.githubId || "",
+					});
+
+					if ('id' in ghDeployment) {
+						githubDeploymentId = ghDeployment.id;
+						// Store GitHub deployment ID
+						await updatePreviewDeployment(previewDeploymentId, {
+							githubDeploymentId: String(githubDeploymentId),
+						});
+
+						// Set deployment status to in_progress
+						await updateGithubDeploymentStatus({
+							owner: application.owner || "",
+							repository: application.repository || "",
+							deploymentId: githubDeploymentId,
+							state: "in_progress",
+							environmentUrl: `https://${previewDomain}`,
+							description: "Deployment is building...",
+							githubId: application.githubId || "",
+						});
+					}
+				} catch (error) {
+					console.error("Failed to create GitHub deployment:", error);
+				}
+
+				// Set commit status to pending
+				try {
+					await createCommitStatus({
+						owner: application.owner || "",
+						repository: application.repository || "",
+						sha: commitHash,
+						state: "pending",
+						targetUrl: `https://${previewDomain}`,
+						description: "Deployment is building...",
+						context: "Dokploy Preview Deployment",
+						githubId: application.githubId || "",
+					});
+				} catch (error) {
+					console.error("Failed to create commit status:", error);
+				}
+			}
+
 			command += await getBuildCommand(application);
 
 			const commandWithLog = `(${command}) >> ${deployment.logPath} 2>&1`;
@@ -436,6 +508,41 @@ export const deployPreviewApplication = async ({
 		await updatePreviewDeployment(previewDeploymentId, {
 			previewStatus: "done",
 		});
+
+		// Update commit status to success
+		if (commitHash && application.githubId) {
+			try {
+				await createCommitStatus({
+					owner: application.owner || "",
+					repository: application.repository || "",
+					sha: commitHash,
+					state: "success",
+					targetUrl: `https://${previewDomain}`,
+					description: "Deployment succeeded",
+					context: "Dokploy Preview Deployment",
+					githubId: application.githubId,
+				});
+			} catch (error) {
+				console.error("Failed to update commit status:", error);
+			}
+		}
+
+		// Update GitHub deployment status to success
+		if (githubDeploymentId && application.githubId) {
+			try {
+				await updateGithubDeploymentStatus({
+					owner: application.owner || "",
+					repository: application.repository || "",
+					deploymentId: githubDeploymentId,
+					state: "success",
+					environmentUrl: `https://${previewDomain}`,
+					description: "Deployment completed successfully",
+					githubId: application.githubId,
+				});
+			} catch (error) {
+				console.error("Failed to update GitHub deployment status:", error);
+			}
+		}
 	} catch (error) {
 		const comment = getIssueComment(application.name, "error", previewDomain);
 		await updateIssueComment({
@@ -446,6 +553,42 @@ export const deployPreviewApplication = async ({
 		await updatePreviewDeployment(previewDeploymentId, {
 			previewStatus: "error",
 		});
+
+		// Update commit status to failure
+		if (commitHash && application.githubId) {
+			try {
+				await createCommitStatus({
+					owner: application.owner || "",
+					repository: application.repository || "",
+					sha: commitHash,
+					state: "failure",
+					targetUrl: `https://${previewDomain}`,
+					description: "Deployment failed",
+					context: "Dokploy Preview Deployment",
+					githubId: application.githubId,
+				});
+			} catch (error) {
+				console.error("Failed to update commit status:", error);
+			}
+		}
+
+		// Update GitHub deployment status to failure
+		if (githubDeploymentId && application.githubId) {
+			try {
+				await updateGithubDeploymentStatus({
+					owner: application.owner || "",
+					repository: application.repository || "",
+					deploymentId: githubDeploymentId,
+					state: "failure",
+					environmentUrl: `https://${previewDomain}`,
+					description: "Deployment failed",
+					githubId: application.githubId,
+				});
+			} catch (error) {
+				console.error("Failed to update GitHub deployment status:", error);
+			}
+		}
+
 		throw error;
 	}
 
@@ -482,6 +625,9 @@ export const rebuildPreviewApplication = async ({
 		githubId: application?.githubId || "",
 	};
 
+	let githubDeploymentId: number | null = null;
+	const commitHash = previewDeployment.commitHash;
+
 	try {
 		const commentExists = await issueCommentExists({
 			...issueParams,
@@ -514,6 +660,53 @@ export const rebuildPreviewApplication = async ({
 			...issueParams,
 			body: `### Dokploy Preview Deployment\n\n${buildingComment}`,
 		});
+
+		// Set commit status to pending if we have a commit hash
+		if (commitHash && application.githubId) {
+			try {
+				await createCommitStatus({
+					owner: application.owner || "",
+					repository: application.repository || "",
+					sha: commitHash,
+					state: "pending",
+					targetUrl: `https://${previewDomain}`,
+					description: "Rebuild in progress...",
+					context: "Dokploy Preview Deployment",
+					githubId: application.githubId,
+				});
+			} catch (error) {
+				console.error("Failed to create commit status:", error);
+			}
+
+			// Create a new GitHub deployment for the rebuild
+			try {
+				const ghDeployment = await createGithubDeployment({
+					owner: application.owner || "",
+					repository: application.repository || "",
+					ref: commitHash,
+					environment: "preview",
+					description: `Rebuild preview deployment for PR #${previewDeployment.pullRequestNumber}`,
+					githubId: application.githubId,
+				});
+
+				if ('id' in ghDeployment) {
+					githubDeploymentId = ghDeployment.id;
+
+					// Set deployment status to in_progress
+					await updateGithubDeploymentStatus({
+						owner: application.owner || "",
+						repository: application.repository || "",
+						deploymentId: githubDeploymentId,
+						state: "in_progress",
+						environmentUrl: `https://${previewDomain}`,
+						description: "Rebuild is running...",
+						githubId: application.githubId,
+					});
+				}
+			} catch (error) {
+				console.error("Failed to create GitHub deployment:", error);
+			}
+		}
 
 		// Set application properties for preview deployment
 		application.appName = previewDeployment.appName;
@@ -550,6 +743,41 @@ export const rebuildPreviewApplication = async ({
 		await updatePreviewDeployment(previewDeploymentId, {
 			previewStatus: "done",
 		});
+
+		// Update commit status to success
+		if (commitHash && application.githubId) {
+			try {
+				await createCommitStatus({
+					owner: application.owner || "",
+					repository: application.repository || "",
+					sha: commitHash,
+					state: "success",
+					targetUrl: `https://${previewDomain}`,
+					description: "Rebuild succeeded",
+					context: "Dokploy Preview Deployment",
+					githubId: application.githubId,
+				});
+			} catch (error) {
+				console.error("Failed to update commit status:", error);
+			}
+		}
+
+		// Update GitHub deployment status to success
+		if (githubDeploymentId && application.githubId) {
+			try {
+				await updateGithubDeploymentStatus({
+					owner: application.owner || "",
+					repository: application.repository || "",
+					deploymentId: githubDeploymentId,
+					state: "success",
+					environmentUrl: `https://${previewDomain}`,
+					description: "Rebuild completed successfully",
+					githubId: application.githubId,
+				});
+			} catch (error) {
+				console.error("Failed to update GitHub deployment status:", error);
+			}
+		}
 	} catch (error) {
 		let command = "";
 
@@ -577,6 +805,42 @@ export const rebuildPreviewApplication = async ({
 		await updatePreviewDeployment(previewDeploymentId, {
 			previewStatus: "error",
 		});
+
+		// Update commit status to failure
+		if (commitHash && application.githubId) {
+			try {
+				await createCommitStatus({
+					owner: application.owner || "",
+					repository: application.repository || "",
+					sha: commitHash,
+					state: "failure",
+					targetUrl: `https://${previewDomain}`,
+					description: "Rebuild failed",
+					context: "Dokploy Preview Deployment",
+					githubId: application.githubId,
+				});
+			} catch (error) {
+				console.error("Failed to update commit status:", error);
+			}
+		}
+
+		// Update GitHub deployment status to failure
+		if (githubDeploymentId && application.githubId) {
+			try {
+				await updateGithubDeploymentStatus({
+					owner: application.owner || "",
+					repository: application.repository || "",
+					deploymentId: githubDeploymentId,
+					state: "failure",
+					environmentUrl: `https://${previewDomain}`,
+					description: "Rebuild failed",
+					githubId: application.githubId,
+				});
+			} catch (error) {
+				console.error("Failed to update GitHub deployment status:", error);
+			}
+		}
+
 		throw error;
 	}
 

@@ -37,6 +37,8 @@ export const previewDeployments = pgTable("preview_deployments", {
 		.notNull()
 		.$defaultFn(() => new Date().toISOString()),
 	expiresAt: text("expiresAt"),
+	commitHash: text("commitHash"), // SHA of the commit being deployed
+	githubDeploymentId: text("githubDeploymentId"), // GitHub deployment ID for tracking
 });
 
 export const previewDeploymentsRelations = relations(

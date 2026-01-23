@@ -345,3 +345,247 @@ export const createSecurityBlockedComment = async ({
 		return null;
 	}
 };
+
+/**
+ * Create or update a commit status on GitHub
+ * This appears as a check on commits and PRs
+ */
+export const createCommitStatus = async ({
+	owner,
+	repository,
+	sha,
+	state,
+	targetUrl,
+	description,
+	context = "Dokploy Deployment",
+	githubId,
+}: {
+	owner: string;
+	repository: string;
+	sha: string;
+	state: "pending" | "success" | "error" | "failure";
+	targetUrl?: string;
+	description?: string;
+	context?: string;
+	githubId: string;
+}) => {
+	try {
+		const github = await findGithubById(githubId);
+		const octokit = authGithub(github);
+
+		const status = await octokit.rest.repos.createCommitStatus({
+			owner,
+			repo: repository,
+			sha,
+			state,
+			target_url: targetUrl,
+			description:
+				description ||
+				(state === "pending"
+					? "Deployment in progress..."
+					: state === "success"
+						? "Deployment succeeded"
+						: "Deployment failed"),
+			context,
+		});
+
+		console.log(
+			`✅ Commit status ${state} set for ${sha.substring(0, 7)}: ${status.data.url}`,
+		);
+		return status.data;
+	} catch (error) {
+		console.error(`❌ Failed to create commit status for ${sha}:`, error);
+		throw error;
+	}
+};
+
+/**
+ * Create a GitHub deployment
+ * This creates a deployment entry that shows in the PR and GitHub UI
+ */
+export const createGithubDeployment = async ({
+	owner,
+	repository,
+	ref,
+	environment = "preview",
+	description,
+	autoMerge = false,
+	githubId,
+}: {
+	owner: string;
+	repository: string;
+	ref: string;
+	environment?: string;
+	description?: string;
+	autoMerge?: boolean;
+	githubId: string;
+}) => {
+	try {
+		const github = await findGithubById(githubId);
+		const octokit = authGithub(github);
+
+		const deployment = await octokit.rest.repos.createDeployment({
+			owner,
+			repo: repository,
+			ref,
+			environment,
+			description: description || `Deploying to ${environment}`,
+			auto_merge: autoMerge,
+			required_contexts: [], // Skip required status checks for deployments
+		});
+
+		if ('id' in deployment.data) {
+			console.log(
+				`✅ GitHub deployment created for ${ref} in ${environment}: ${deployment.data.id}`,
+			);
+			return deployment.data;
+		}
+		throw new Error('Failed to create GitHub deployment: Invalid response');
+	} catch (error) {
+		console.error(`❌ Failed to create GitHub deployment for ${ref}:`, error);
+		throw error;
+	}
+};
+
+/**
+ * Update a GitHub deployment status
+ * This updates the status of a deployment (in_progress, success, failure, etc.)
+ */
+export const updateGithubDeploymentStatus = async ({
+	owner,
+	repository,
+	deploymentId,
+	state,
+	environmentUrl,
+	description,
+	githubId,
+}: {
+	owner: string;
+	repository: string;
+	deploymentId: number;
+	state:
+		| "error"
+		| "failure"
+		| "inactive"
+		| "in_progress"
+		| "queued"
+		| "pending"
+		| "success";
+	environmentUrl?: string;
+	description?: string;
+	githubId: string;
+}) => {
+	try {
+		const github = await findGithubById(githubId);
+		const octokit = authGithub(github);
+
+		const status = await octokit.rest.repos.createDeploymentStatus({
+			owner,
+			repo: repository,
+			deployment_id: deploymentId,
+			state,
+			environment_url: environmentUrl,
+			description:
+				description ||
+				(state === "in_progress"
+					? "Deployment is running..."
+					: state === "success"
+						? "Deployment completed successfully"
+						: "Deployment failed"),
+		});
+
+		console.log(
+			`✅ Deployment status ${state} set for deployment ${deploymentId}: ${status.data.url}`,
+		);
+		return status.data;
+	} catch (error) {
+		console.error(
+			`❌ Failed to update deployment status for ${deploymentId}:`,
+			error,
+		);
+		throw error;
+	}
+};
+
+/**
+ * Create or update branch protection rules to require status checks
+ * This blocks PRs until the specified status checks pass
+ */
+export const updateBranchProtection = async ({
+	owner,
+	repository,
+	branch,
+	requiredStatusChecks = ["Dokploy Deployment"],
+	enforceAdmins = false,
+	githubId,
+}: {
+	owner: string;
+	repository: string;
+	branch: string;
+	requiredStatusChecks?: string[];
+	enforceAdmins?: boolean;
+	githubId: string;
+}) => {
+	try {
+		const github = await findGithubById(githubId);
+		const octokit = authGithub(github);
+
+		// First, get current protection settings to preserve other rules
+		let currentProtection = null;
+		try {
+			const response = await octokit.rest.repos.getBranchProtection({
+				owner,
+				repo: repository,
+				branch,
+			});
+			currentProtection = response.data;
+		} catch (error) {
+			// Branch might not have protection yet
+			console.log(
+				`ℹ️  No existing branch protection found for ${branch}, creating new protection`,
+			);
+		}
+
+		const protection = await octokit.rest.repos.updateBranchProtection({
+			owner,
+			repo: repository,
+			branch,
+			required_status_checks: {
+				strict: true, // Require branches to be up to date before merging
+				contexts: requiredStatusChecks,
+			},
+			enforce_admins: enforceAdmins,
+			required_pull_request_reviews: currentProtection?.required_pull_request_reviews
+				? {
+						dismiss_stale_reviews:
+							currentProtection.required_pull_request_reviews
+								.dismiss_stale_reviews,
+						require_code_owner_reviews:
+							currentProtection.required_pull_request_reviews
+								.require_code_owner_reviews,
+						required_approving_review_count:
+							currentProtection.required_pull_request_reviews
+								.required_approving_review_count,
+					}
+				: null,
+			restrictions: currentProtection?.restrictions
+				? {
+						users: currentProtection.restrictions.users?.map((u) => u.login).filter((login): login is string => login !== undefined) || [],
+						teams: currentProtection.restrictions.teams?.map((t) => t.slug).filter((slug): slug is string => slug !== undefined) || [],
+						apps: currentProtection.restrictions.apps?.map((a) => a.slug).filter((slug): slug is string => slug !== undefined) || [],
+					}
+				: null,
+		});
+
+		console.log(
+			`✅ Branch protection updated for ${branch} with required status checks: ${requiredStatusChecks.join(", ")}`,
+		);
+		return protection.data;
+	} catch (error) {
+		console.error(
+			`❌ Failed to update branch protection for ${branch}:`,
+			error,
+		);
+		throw error;
+	}
+};
